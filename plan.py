@@ -1,162 +1,201 @@
-import random
+# -*- coding: utf-8 -*-
+"""
+《放鳥同盟》FlakeOut Web App - 本地 HTTP 伺服器與 API Proxy
+此腳本採用 Python 內建的 http.server 與 urllib 模組，不需使用 pip 安裝第三方套件。
+執行此程式會自動在瀏覽器中開啟：http://localhost:8000
+"""
+
+import http.server
+import socketserver
+import urllib.request
+import urllib.error
+import json
 import os
+import webbrowser
+import sys
 
+# 強制將輸出編碼設為 UTF-8，防止 Windows 環境下印出 Emoji 或特殊字元時崩潰
 try:
-    import anthropic
-    HAS_ANTHROPIC = True
-except ImportError:
-    HAS_ANTHROPIC = False
+    if sys.stdout.encoding != 'utf-8':
+        sys.stdout.reconfigure(encoding='utf-8')
+    if sys.stderr.encoding != 'utf-8':
+        sys.stderr.reconfigure(encoding='utf-8')
+except AttributeError:
+    # 舊版 Python 不支援 reconfigure 時的備用處理
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
+PORT = 8000
+# 取得目前腳本所在的目錄
+DIRECTORY = os.path.dirname(os.path.abspath(__file__))
 
-# ── 備用藉口庫（無 API 時使用）──────────────────────────────────────
+class FlakeOutHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        # 設定伺服器工作的靜態檔案目錄
+        super().__init__(*args, directory=DIRECTORY, **kwargs)
 
-FALLBACK_EXCUSES = {
-    "老闆": [
-        "我的電腦剛自動更新，進度條卡在 99%，我必須用念力守護它完成，不然公司機密檔案會蒸發。",
-        "我突然接到量子力學領域的緊急諮詢電話，為了公司的未來，我必須留在家裡專心通話。",
-        "我家巷口被共享單車集體罷工給堵死了，里長說現在進出需要通行證，我正在排隊申請。",
-    ],
-    "朋友": [
-        "我剛踩到一隻螞蟻，內心充滿愧疚，決定在家為牠點燈祈福三小時，真的走不開。",
-        "我家的貓剛剛用『你敢出門試試看』的眼神看著我，為了生命安全，我決定妥協。",
-        "外送員留下一句『這是一碗有故事的麵』，我必須花一整晚品嚐並感悟人生。",
-    ],
-    "曖昧對象 / 另一半": [
-        "算命師說我今天如果出門，會因為太帥/太美引發 street fight，為了你的安全，我含淚留在家。",
-        "我今天衣服顏色跟宇宙磁場不合，一出門就會引力失衡，請原諒我的物理限制。",
-        "我在路上撿到一隻迷路的毛毛蟲，牠指名要我送牠去附近公園，這是一場關乎生態平衡的救援。",
-    ],
-}
+    def do_GET(self):
+        """處理網頁靜態檔案讀取"""
+        if self.path == '/':
+            self.path = '/index.html'
+        
+        # 移除 query parameters 避免找不到檔案
+        clean_path = self.path.split('?')[0]
+        
+        # 處理 Windows 環境下的 URL 編碼（特別是中文檔名）
+        import urllib.parse
+        clean_path = urllib.parse.unquote(clean_path)
+        
+        filepath = os.path.join(DIRECTORY, clean_path.lstrip('/'))
+        
+        if os.path.exists(filepath) and os.path.isfile(filepath):
+            # 設定正確的 Content-Type 以防瀏覽器解析錯誤
+            mime_type = "text/plain; charset=utf-8"
+            if filepath.endswith('.html'):
+                mime_type = "text/html; charset=utf-8"
+            elif filepath.endswith('.css'):
+                mime_type = "text/css; charset=utf-8"
+            elif filepath.endswith('.js'):
+                mime_type = "application/javascript; charset=utf-8"
+            elif filepath.endswith('.png'):
+                mime_type = "image/png"
+            elif filepath.endswith('.jpg') or filepath.endswith('.jpeg'):
+                mime_type = "image/jpeg"
+                
+            try:
+                with open(filepath, 'rb') as f:
+                    content = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", mime_type)
+                self.send_header("Content-Length", str(len(content)))
+                self.end_headers()
+                self.wfile.write(content)
+            except Exception as e:
+                self.send_error(500, f"伺服器內部錯誤: {e}")
+        else:
+            self.send_error(404, "找不到指定的檔案")
 
-WEATHER_EFFECTS = {
-    "下大雨": "外面正下著大雨，我的心也跟著在下雨，體感溫度直接降到絕對零度，實在動彈不得。",
-    "大太陽": "現在太陽大到紫外線能直接穿透靈魂，我體內的吸血鬼基因正在隱隱作痛，無法在紫外線下前進。",
-    "陰天":   "這種陰沉的天氣讓我的右腳膝蓋發出「不宜遠行」的警告音效，我必須尊重身體的直覺。",
-}
+    def do_POST(self):
+        """處理 AI 藉口生成的 Proxy 請求"""
+        if self.path == '/api/generate':
+            try:
+                content_length = int(self.headers['Content-Length'])
+                post_data = self.rfile.read(content_length)
+                
+                req_data = json.loads(post_data.decode('utf-8'))
+                target = req_data.get('target', '朋友')
+                weather = req_data.get('weather', '下大雨')
+                time_of_day = req_data.get('time', '下午')
+                api_key = req_data.get('apiKey', '')
+                
+                if not api_key:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write("錯誤：未填寫 Anthropic API Key".encode('utf-8'))
+                    return
+                
+                # 發送請求至 Anthropic Claude API (使用內建 urllib 避免 CORS 限制)
+                excuse = self.call_anthropic_api(target, weather, time_of_day, api_key)
+                
+                # 回傳 JSON 結果給前端
+                response_data = json.dumps({"excuse": excuse}).encode('utf-8')
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(response_data)))
+                self.end_headers()
+                self.wfile.write(response_data)
+                
+            except urllib.error.HTTPError as e:
+                err_content = e.read().decode('utf-8')
+                print(f"Anthropic API 錯誤回傳: {err_content}", file=sys.stderr)
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                
+                # 嘗試提取 API 回傳的錯誤訊息
+                try:
+                    err_json = json.loads(err_content)
+                    err_msg = err_json.get('error', {}).get('message', err_content)
+                except Exception:
+                    err_msg = err_content
+                    
+                self.wfile.write(f"Claude API 錯誤：{err_msg}".encode('utf-8'))
+                
+            except Exception as e:
+                print(f"本地伺服器錯誤: {e}", file=sys.stderr)
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(f"伺服器內部錯誤：{e}".encode('utf-8'))
+        else:
+            self.send_error(404, "找不到指定的路徑")
 
-TIME_EFFECTS = {
-    "早上": "這個時間點太陽磁場太強，我的大腦還沒完全下載完今天的開機檔案。",
-    "下午": "這個尷尬的時間，我的靈魂正處於微波加熱的狀態，如果被打斷會變得很難吃（？）。",
-    "晚上": "月亮的光線角度剛好折射到我的懶惰神經，導致我整個人暫時性癱瘓。",
-}
-
-ENERGY_RANGE = {
-    "老闆":           (150, 200),
-    "朋友":           (50,  90),
-    "曖昧對象 / 另一半": (100, 140),
-}
-
-
-# ── AI 藉口生成 ────────────────────────────────────────────────────
-
-def generate_excuse_ai(target: str, weather: str, time_of_day: str) -> str:
-    """呼叫 Claude API 生成藉口（需安裝 anthropic 套件並設定 ANTHROPIC_API_KEY）"""
-    client = anthropic.Anthropic()  # 自動讀取環境變數 ANTHROPIC_API_KEY
-
-    prompt = f"""你是「放鳥同盟App」的AI藉口大師。請根據以下條件生成一個放鳥藉口：
+    def call_anthropic_api(self, target, weather, time_of_day, api_key):
+        """透過 HTTPS 請求直接與 Anthropic API 通訊"""
+        prompt = f"""你是「放鳥同盟App」的AI藉口大師。請根據以下條件生成一個放鳥藉口：
 - 放鳥對象：{target}
 - 天氣：{weather}
 - 時間：{time_of_day}
 
 要求：
-1. 藉口必須超扯、荒謬、但又帶點哲理或莫名合理性，讓對方哭笑不得
-2. 要結合天氣和時間製造「客觀因素不可抗力」的感覺
-3. 語氣要帶點無辜、抱歉但又理所當然
-4. 字數約 100~150 字
-5. 直接輸出藉口內容，不要加任何標題或說明，用第一人稱
+1. 藉口必須超扯、荒謬、但又帶點哲理或莫名合理性，讓對方哭笑不得。
+2. 要結合天氣 and 時間製造「客觀因素不可抗力」的感覺。
+3. 語氣要帶點無辜、抱歉但又理所當然，使用台灣繁體中文口吻與用語。
+4. 字數約 100~150 字。
+5. 直接輸出藉口內容，不要加任何引號、標題或說明，用第一人稱「我」。
 
 只輸出藉口本文，不要任何前言後語。"""
 
-    message = client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return message.content[0].text
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01"
+        }
+        
+        data = {
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ]
+        }
+        
+        req = urllib.request.Request(
+            url, 
+            data=json.dumps(data).encode('utf-8'), 
+            headers=headers, 
+            method='POST'
+        )
+        
+        # 設定超時為 30 秒
+        with urllib.request.urlopen(req, timeout=30) as response:
+            res_body = json.loads(response.read().decode('utf-8'))
+            return res_body['content'][0]['text'].strip()
 
+def run_server():
+    # 允許快速重用 Socket 連接埠
+    socketserver.TCPServer.allow_reuse_address = True
+    try:
+        with socketserver.TCPServer(("", PORT), FlakeOutHTTPRequestHandler) as httpd:
+            print("=" * 70)
+            print("        [放鳥同盟] FlakeOut Web App 本地伺服器已啟動")
+            print(f"        -> 請至此網址體驗：http://localhost:{PORT}")
+            print("        提示：網頁將會自動開啟。在網頁輸入 API Key，即可安全呼叫 AI 模式。")
+            print("        如果要關閉伺服器，請在終端機按下 Ctrl+C 結束。")
+            print("=" * 70)
+            
+            # 自動使用預設瀏覽器開啟網址
+            try:
+                webbrowser.open(f"http://localhost:{PORT}")
+            except Exception as e:
+                print(f"無法自動開啟瀏覽器，請手動輸入網址，錯誤原因：{e}")
+                
+            httpd.serve_forever()
+    except Exception as e:
+        print(f"伺服器啟動失敗，請檢查 {PORT} 連接埠是否已被佔用。錯誤原因：{e}")
 
-def generate_excuse_fallback(target: str, weather: str, time_of_day: str) -> str:
-    """備用邏輯：從藉口庫隨機組合"""
-    key = target if target in FALLBACK_EXCUSES else random.choice(list(FALLBACK_EXCUSES.keys()))
-    base   = random.choice(FALLBACK_EXCUSES[key])
-    w_text = WEATHER_EFFECTS.get(weather, "現在的天氣磁場怪怪的，不宜出門。")
-    t_text = TIME_EFFECTS.get(time_of_day, "這個時間點真的不適合人類進行社交活動。")
-    return f"{t_text}其實{base}{w_text}"
-
-
-# ── 社交能量計算器 ─────────────────────────────────────────────────
-
-def calculate_energy(target: str) -> int:
-    lo, hi = ENERGY_RANGE.get(target, (60, 100))
-    return random.randint(lo, hi)
-
-
-# ── 互動式主程式 ───────────────────────────────────────────────────
-
-def print_banner():
-    print("=" * 50)
-    print("        歡迎來到《放鳥同盟》FlakeOut App")
-    print("      —— 大家做社交，我偏反社交 ——")
-    print("=" * 50)
-    if HAS_ANTHROPIC and os.environ.get("ANTHROPIC_API_KEY"):
-        print("✅  AI 模式：已連線 Claude API")
-    else:
-        print("⚠️   備用模式：未偵測到 API Key，使用內建藉口庫")
-        if not HAS_ANTHROPIC:
-            print("    （安裝方式：pip install anthropic）")
-    print()
-
-
-def prompt_choice(question: str, options: list[str]) -> str:
-    print(question)
-    for i, opt in enumerate(options, 1):
-        print(f"  {i}. {opt}")
-    while True:
-        raw = input("請輸入選項編號：").strip()
-        if raw.isdigit() and 1 <= int(raw) <= len(options):
-            return options[int(raw) - 1]
-        print("  ❌ 請輸入有效的編號")
-
-
-def main():
-    print_banner()
-
-    targets  = ["老闆", "朋友", "曖昧對象 / 另一半"]
-    weathers = ["下大雨", "大太陽", "陰天"]
-    times    = ["早上", "下午", "晚上"]
-
-    target      = prompt_choice("1. 今天要放鳥誰？", targets)
-    weather     = prompt_choice("\n2. 目前外面的天氣如何？", weathers)
-    time_of_day = prompt_choice("\n3. 聚會的時間點？", times)
-
-    print("\n正在啟動 AI 藉口生成引擎 ...")
-    print("-" * 50)
-
-    use_ai = HAS_ANTHROPIC and bool(os.environ.get("ANTHROPIC_API_KEY"))
-    if use_ai:
-        try:
-            excuse = generate_excuse_ai(target, weather, time_of_day)
-        except Exception as e:
-            print(f"⚠️  API 呼叫失敗（{e}），改用備用模式")
-            excuse = generate_excuse_fallback(target, weather, time_of_day)
-    else:
-        excuse = generate_excuse_fallback(target, weather, time_of_day)
-
-    print(f"\n【完美藉口產生成功】\n")
-    print(f"「{excuse}」")
-
-    energy = calculate_energy(target)
-    print("\n" + "-" * 50)
-    print(f"🎉  放鳥成功！")
-    print(f"🔋  今日省下的社交能量值：+{energy} 點！")
-    print(f"💡  提示：把這些能量拿去追劇或躺平吧。")
-    print("-" * 50)
-
-    again = input("\n要再生成一個藉口嗎？(y/n): ").strip().lower()
-    if again == "y":
-        print()
-        main()
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    run_server()
